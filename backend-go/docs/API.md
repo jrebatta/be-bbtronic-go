@@ -1,5 +1,8 @@
 # BBtronic REST API v1
 
+> Contrato máquina: **[swagger.yml](swagger.yml)** (OpenAPI 3.1, validado con `npx @redocly/cli@2 lint docs/swagger.yml`;
+> `TestOpenAPIContractCoversRoutes` falla si el router y el contrato divergen).
+
 Contrato implementado en `internal/httpapi`, `internal/coordinator` e `internal/game`.
 Base: `/api/v1`. JSON UTF-8. **IDs y versiones son strings decimales** (seguros para JS).
 Fechas RFC 3339 UTC. Todo `GET` es lectura pura (`Cache-Control: no-store`); ningún `GET`

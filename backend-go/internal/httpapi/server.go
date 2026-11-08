@@ -51,19 +51,9 @@ func New(svc *coordinator.Service, log *slog.Logger, opts Options) http.Handler 
 		allowed[o] = true
 	}
 	rest := http.NewServeMux()
-	rest.HandleFunc("POST /api/v1/players", a.register)
-	rest.HandleFunc("GET /api/v1/players/me", a.authed(a.me))
-	rest.HandleFunc("DELETE /api/v1/players/me", a.logout)
-	rest.HandleFunc("POST /api/v1/rooms", a.authed(a.createRoom))
-	rest.HandleFunc("POST /api/v1/rooms/{code}/members", a.authed(a.joinRoom))
-	rest.HandleFunc("GET /api/v1/rooms/{code}/state", a.authed(a.state))
-	rest.HandleFunc("POST /api/v1/rooms/{code}/commands", a.authed(a.command))
-	rest.HandleFunc("GET /api/v1/rooms/{code}/games/current/role", a.authed(a.role))
-	rest.HandleFunc("POST /api/v1/rooms/{code}/reconcile", a.authed(a.reconcile))
-	rest.HandleFunc("POST /api/v1/rooms/{code}/connections", a.authed(a.openConnection))
-	rest.HandleFunc("PUT /api/v1/rooms/{code}/connections/{id}", a.authed(a.renewConnection))
-	rest.HandleFunc("DELETE /api/v1/rooms/{code}/connections/{id}", a.authed(a.closeConnection))
-	rest.HandleFunc("GET /readyz", a.readyz)
+	for _, rt := range a.restRoutes() {
+		rest.HandleFunc(rt.pattern, rt.handler)
+	}
 	rest.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, game.Errf(game.CodeNotFound, "ruta no encontrada"))
 	})
@@ -77,6 +67,34 @@ func New(svc *coordinator.Service, log *slog.Logger, opts Options) http.Handler 
 	}
 	root.Handle("/", withRESTLimits(opts.BodyLimit, opts.RequestTimeout, rest))
 	return withObservability(log, withSecurityHeaders(withCORS(allowed, root)))
+}
+
+type route struct {
+	pattern string
+	handler http.HandlerFunc
+}
+
+// RootRoutes are served outside the REST limits middleware.
+var RootRoutes = []string{"GET /healthz", "GET /api/v1/realtime"}
+
+// restRoutes is the single table of REST routes. docs/swagger.yml must
+// document exactly these plus RootRoutes (TestOpenAPIContractCoversRoutes).
+func (a *api) restRoutes() []route {
+	return []route{
+		{"POST /api/v1/players", a.register},
+		{"GET /api/v1/players/me", a.authed(a.me)},
+		{"DELETE /api/v1/players/me", a.logout},
+		{"POST /api/v1/rooms", a.authed(a.createRoom)},
+		{"POST /api/v1/rooms/{code}/members", a.authed(a.joinRoom)},
+		{"GET /api/v1/rooms/{code}/state", a.authed(a.state)},
+		{"POST /api/v1/rooms/{code}/commands", a.authed(a.command)},
+		{"GET /api/v1/rooms/{code}/games/current/role", a.authed(a.role)},
+		{"POST /api/v1/rooms/{code}/reconcile", a.authed(a.reconcile)},
+		{"POST /api/v1/rooms/{code}/connections", a.authed(a.openConnection)},
+		{"PUT /api/v1/rooms/{code}/connections/{id}", a.authed(a.renewConnection)},
+		{"DELETE /api/v1/rooms/{code}/connections/{id}", a.authed(a.closeConnection)},
+		{"GET /readyz", a.readyz},
+	}
 }
 
 var (

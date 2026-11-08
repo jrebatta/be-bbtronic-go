@@ -1,0 +1,1294 @@
+openapi: 3.1.0
+info:
+  title: BBtronic API
+  version: 1.0.0
+  description: |
+    REST v1 del backend Go de BBtronic (fuente: `internal/httpapi`, `internal/coordinator`, `internal/game`).
+
+    **Convenciones**
+    - JSON UTF-8. Los IDs y las versiones son **strings decimales** (seguros para JavaScript). Fechas RFC 3339 UTC.
+    - Todo `GET` es lectura pura y devuelve `Cache-Control: no-store`.
+    - Identidad solo por `Authorization: Bearer <accessToken>`; nunca por un campo `username`.
+    - Mutaciones críticas exigen `Idempotency-Key`: reintentar con la misma clave y el mismo cuerpo devuelve el
+      resultado confirmado con `replayed: true`; misma clave con otro cuerpo → `409 IDEMPOTENCY_KEY_REUSED`.
+      Retención de recibos: 24 h.
+    - Los comandos de control del anfitrión exigen `expectedVersion`; si el estado cambió → `409 STATE_CONFLICT`
+      con `details.currentVersion`. Tras un 409: resincronizar y pedir nueva intención (no reintentar a ciegas).
+    - Peticiones con un `Origin` no incluido en `ALLOWED_ORIGINS` → `403 FORBIDDEN`.
+    - Límites: cuerpo ≤ 64 KiB (`413`), JSON estricto (campos desconocidos → `400`), rate limit local por instancia
+      (registro 10/min por IP, comandos ~10/s por jugador, ráfaga 40).
+
+    El tiempo real usa WebSocket (`GET /api/v1/realtime`); su protocolo de mensajes está descrito en
+    `docs/WEBSOCKET.md` y resumido en el esquema `WsEnvelope`.
+servers:
+  - url: http://localhost:8080
+    description: Desarrollo local
+  - url: https://{deployment}.vercel.app
+    description: Despliegue en Vercel (Preview/Production)
+    variables:
+      deployment:
+        default: bbtronic-backend
+tags:
+  - name: Players
+    description: Registro, identidad y salida (Java `UserController`).
+  - name: Rooms
+    description: Salas, membresía y snapshot (Java `GameSessionController`).
+  - name: Commands
+    description: Todas las acciones de sala y de los seis juegos.
+  - name: Presence
+    description: Leases de conexión para el fallback HTTP sin WebSocket.
+  - name: Realtime
+    description: WebSocket JSON v1.
+  - name: Operations
+    description: Salud y disponibilidad.
+
+security:
+  - bearerAuth: []
+
+paths:
+  /api/v1/players:
+    post:
+      tags: [Players]
+      operationId: registerPlayer
+      summary: Registrar un jugador (N1)
+      description: |
+        Crea un jugador con nombre globalmente único y emite su token (solo se devuelve aquí; en BD se guarda su
+        SHA-256). Nombre: 1–32 caracteres (letras, dígitos, espacios y `._-'`), sin espacios al inicio/fin.
+        Un registro nunca unido a una sala libera su nombre a los 15 minutos o al expirar el token.
+        Equivale a Java `POST /api/users/register` y a la parte de registro de `create`/`join`.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/RegisterRequest'}
+            example: {username: Ana María}
+      responses:
+        '201':
+          description: Jugador creado.
+          headers:
+            X-Request-Id: {$ref: '#/components/headers/X-Request-Id'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/RegisterResponse'}
+              example:
+                player: {id: '12', username: Ana María}
+                accessToken: q3V8d1Yv0m3c2pZ4nH7sL9tKfR2xW5bA6eJ1gU8yQ0o
+                expiresAt: '2026-11-09T12:00:00Z'
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '409':
+          description: El nombre ya está en uso.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+              example:
+                error: {code: NAME_TAKEN, message: el nombre de usuario ya está en uso, retryable: false}
+                requestId: 63ca70eed49d00ab
+        '413': {$ref: '#/components/responses/PayloadTooLarge'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+        '500': {$ref: '#/components/responses/InternalError'}
+
+  /api/v1/players/me:
+    get:
+      tags: [Players]
+      operationId: getMe
+      summary: Jugador autenticado y su sala (N2)
+      responses:
+        '200':
+          description: Identidad del token y sala activa (o null).
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/MeResponse'}
+              example:
+                player: {id: '12', username: Ana María}
+                room: {code: '4821', epoch: 3f1c2a9e-7b1d-4c2e-9a51-6d8e2f0b4c7a}
+                expiresAt: '2026-11-09T12:00:00Z'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+        '500': {$ref: '#/components/responses/InternalError'}
+    delete:
+      tags: [Players]
+      operationId: logout
+      summary: Salir y eliminar el jugador (N3)
+      description: |
+        Sale de la sala (los juegos se reconcilian: votos invalidados, Impostor eliminado, anfitrión sin sucesión),
+        borra el jugador y libera su nombre (paridad con Java `DELETE /api/users/logout`). Idempotente: sin token
+        o con un token inválido también responde 204, sin revelar si era válido.
+      security:
+        - bearerAuth: []
+        - {}
+      responses:
+        '204': {description: Sesión cerrada (o ya inexistente).}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+        '500': {$ref: '#/components/responses/InternalError'}
+
+  /api/v1/rooms:
+    post:
+      tags: [Rooms]
+      operationId: createRoom
+      summary: Crear sala (N4)
+      description: |
+        Crea una sala con código de 4 dígitos único entre las salas activas; el creador es anfitrión y miembro.
+        Un jugador solo puede pertenecer a una sala activa. Equivale a Java `POST /api/game-sessions/create`.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: {type: object, additionalProperties: false}
+            example: {}
+      responses:
+        '201':
+          description: Sala creada (o replay de la misma clave).
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/RoomResult'}
+              example: {roomCode: '4821', epoch: 3f1c2a9e-7b1d-4c2e-9a51-6d8e2f0b4c7a, playerId: '12', stateVersion: '1', participation: player, replayed: false}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '409':
+          description: Ya pertenece a otra sala (`ALREADY_IN_ROOM`, con `details.roomCode`), sin códigos libres (`LIMIT_REACHED`) o clave reutilizada.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+              example:
+                error: {code: ALREADY_IN_ROOM, message: ya perteneces a otra sala; sal de ella primero, retryable: false, details: {roomCode: '4821'}}
+                requestId: a1b2c3d4e5f60718
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+        '500': {$ref: '#/components/responses/InternalError'}
+
+  /api/v1/rooms/{code}/members:
+    post:
+      tags: [Rooms]
+      operationId: joinRoom
+      summary: Unirse a una sala (N5)
+      description: |
+        Incorpora al jugador autenticado. Repetir siendo miembro es un éxito idempotente. Si hay una partida de
+        El Impostor en curso entra como `spectator` (sin rol ni voto) hasta la siguiente partida.
+        Equivale a Java `POST /api/game-sessions/join`.
+      parameters:
+        - $ref: '#/components/parameters/RoomCode'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/JoinRequest'}
+            example: {epoch: 3f1c2a9e-7b1d-4c2e-9a51-6d8e2f0b4c7a}
+      responses:
+        '200':
+          description: Miembro de la sala.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/RoomResult'}
+              example: {roomCode: '4821', epoch: 3f1c2a9e-7b1d-4c2e-9a51-6d8e2f0b4c7a, playerId: '13', stateVersion: '2', participation: player, replayed: false}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/RoomNotFound'}
+        '409':
+          description: '`ALREADY_IN_ROOM`, `ROOM_FULL` (30), `STALE_EPOCH` o `IDEMPOTENCY_KEY_REUSED`.'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+              example:
+                error: {code: STALE_EPOCH, message: la sala con ese código pertenece a otra generación, retryable: false}
+                requestId: b2c3d4e5f6071829
+        '410': {$ref: '#/components/responses/RoomExpired'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+        '500': {$ref: '#/components/responses/InternalError'}
+
+  /api/v1/rooms/{code}/state:
+    get:
+      tags: [Rooms]
+      operationId: getRoomState
+      summary: Snapshot público de la sala (N6)
+      description: |
+        Estado completo y autoritativo (sustituye Java `GET /{code}`, `/sync`, `/round-info`, `/current-question`,
+        `/vote-results`, `/check-all-voted`). Solo miembros. No contiene tokens, palabra ni roles del Impostor.
+        Nunca muta: si un deadline o una transición de presencia vencieron devuelve
+        `reconciliationRequired: true` y el cliente llama a `POST /reconcile`.
+      parameters:
+        - $ref: '#/components/parameters/RoomCode'
+        - $ref: '#/components/parameters/EpochQuery'
+      responses:
+        '200':
+          description: Snapshot.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Snapshot'}
+              examples:
+                lobby: {$ref: '#/components/examples/SnapshotLobby'}
+                directas: {$ref: '#/components/examples/SnapshotDirectas'}
+                impostorVoting: {$ref: '#/components/examples/SnapshotImpostorVoting'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/RoomNotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+        '500': {$ref: '#/components/responses/InternalError'}
+
+  /api/v1/rooms/{code}/commands:
+    post:
+      tags: [Commands]
+      operationId: executeCommand
+      summary: Ejecutar un comando (N7)
+      description: |
+        Punto único de mutación de sala y juegos (también disponible por WebSocket con el mismo motor y recibos).
+        `Idempotency-Key` debe ser igual a `commandId`.
+
+        | operation | Quién | payload | Equivalente Java |
+        |---|---|---|---|
+        | `room.activate` | anfitrión* | `{}` | `POST /{code}/start-game` |
+        | `member.ready` | propio | `{"ready":true}` | `POST /api/users/{u}/ready` |
+        | `members.resetReady` | anfitrión* | `{}` | `POST /{code}/reset-users-ready` |
+        | `member.kick` | anfitrión* | `KickPayload` | `POST /{code}/kick` |
+        | `room.reset` | anfitrión* | `{}` | `POST /reset` — **siempre 501** (rutina `reset_game_data` sin definir) |
+        | `game.start` | anfitrión* | `GameStartPayload` | `start-preguntas-directas`, `*/start`, `start-preguntas-incomodas`, `el-impostor/start` |
+        | `game.end` | anfitrión* | `{}` | `POST /{code}/end-game` |
+        | `round.new` | anfitrión* | `{}` | `POST /{code}/start-new-round` |
+        | `round.checkReady` | anfitrión* | `{}` | `POST /{code}/check-all-ready` |
+        | `question.submit` | miembro | `QuestionSubmitPayload` | `POST /{code}/send-question` |
+        | `question.next` | anfitrión* | `QuestionNextPayload` | `next-random-question`, `next-*` |
+        | `vote.submit` | miembro / vivo | `ProbableVotePayload` o `ImpostorVotePayload` | `POST /{code}/vote`, `el-impostor/vote` |
+        | `vote.call` | vivo | `{}` | `POST /{code}/el-impostor/call-vote` |
+        | `votes.clear` | anfitrión* | `VotesClearPayload` | `POST /{code}/clear-votes` |
+
+        `*` = exige `expectedVersion`. `gameRunId` es obligatorio cuando hay juego activo; `roundId` en Directas
+        (`question.submit`, `question.next`, `round.checkReady` al iniciar la ronda).
+      parameters:
+        - $ref: '#/components/parameters/RoomCode'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CommandRequest'}
+            examples:
+              startImpostor:
+                summary: Iniciar El Impostor con 1 impostor
+                value: {commandId: 6f1c2a9e7b1d4c2e9a516d8e2f0b4c7a, epoch: 3f1c2a9e-7b1d-4c2e-9a51-6d8e2f0b4c7a, expectedVersion: '7', operation: game.start, payload: {game: el-impostor, impostorCount: 1}}
+              nextCatalog:
+                summary: Siguiente pregunta de catálogo por tipo
+                value: {commandId: 7a2d3b0f8c2e4d3f0b627e9f3a1c5d8b, epoch: 3f1c2a9e-7b1d-4c2e-9a51-6d8e2f0b4c7a, gameRunId: 9b4e1c2d-0a3f-4b5c-8d6e-7f8091a2b3c4, roundId: 1c2d3e4f-5a6b-4c7d-8e9f-0a1b2c3d4e5f, expectedVersion: '9', operation: question.next, payload: {type: picante}}
+              submitQuestion:
+                summary: Enviar pregunta anónima (Directas)
+                value: {commandId: 8b3e4c1a9d3f4e4a1c738fa04b2d6e9c, epoch: 3f1c2a9e-7b1d-4c2e-9a51-6d8e2f0b4c7a, gameRunId: 9b4e1c2d-0a3f-4b5c-8d6e-7f8091a2b3c4, roundId: 1c2d3e4f-5a6b-4c7d-8e9f-0a1b2c3d4e5f, operation: question.submit, payload: {toPlayerId: '13', text: ¿Cuál fue tu peor cita?, anonymous: true}}
+              impostorVote:
+                summary: Voto en El Impostor
+                value: {commandId: 9c4f5d2b0e4a4f5b2d849ab15c3e7fad, epoch: 3f1c2a9e-7b1d-4c2e-9a51-6d8e2f0b4c7a, gameRunId: 9b4e1c2d-0a3f-4b5c-8d6e-7f8091a2b3c4, operation: vote.submit, payload: {votingRoundId: 2d3e4f5a-6b7c-4d8e-9f0a-1b2c3d4e5f60, targetPlayerId: '14'}}
+      responses:
+        '200':
+          description: Comando confirmado (commit realizado) o replay.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CommandResult'}
+              examples:
+                gameStarted:
+                  value: {commandId: 6f1c2a9e7b1d4c2e9a516d8e2f0b4c7a, operation: game.start, committedVersion: '8', replayed: false, result: {gameRunId: 9b4e1c2d-0a3f-4b5c-8d6e-7f8091a2b3c4, roundId: null, phase: description, countdownEndsAt: '2026-11-08T12:00:03Z'}}
+                checkReadyPending:
+                  value: {commandId: 1d2e3f4a5b6c4d7e8f9a0b1c2d3e4f5a, operation: round.checkReady, committedVersion: '4', replayed: false, result: {allReady: false, pendingPlayerIds: ['13', '14'], waitingMessage: 'Beto, Caro avisan', started: false}}
+                exhausted:
+                  value: {commandId: 7a2d3b0f8c2e4d3f0b627e9f3a1c5d8b, operation: question.next, committedVersion: '10', replayed: false, result: {exhausted: true}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/RoomNotFound'}
+        '409':
+          description: |
+            Conflicto de regla o de ámbito: `STATE_CONFLICT`, `STALE_EPOCH`, `STALE_GAME`, `STALE_ROUND`,
+            `STALE_QUESTION`, `WRONG_GAME`, `ALREADY_VOTED`, `NO_QUESTIONS`, `QUESTION_TYPE_EXHAUSTED`,
+            `CATALOG_EMPTY`, `COOLDOWN_ACTIVE` (con `retryAfterMs` y `Retry-After`), `LIMIT_REACHED`,
+            `IDEMPOTENCY_KEY_REUSED`.
+          headers:
+            Retry-After: {$ref: '#/components/headers/Retry-After'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+              examples:
+                versionConflict:
+                  value: {error: {code: STATE_CONFLICT, message: el estado cambió; sincroniza antes de repetir la acción, retryable: false, details: {currentVersion: '11'}}, requestId: c3d4e5f607182930}
+                cooldown:
+                  value: {error: {code: COOLDOWN_ACTIVE, message: espera antes de llamar otra votación, retryable: true, retryAfterMs: 41000, details: {scope: global, retryAfterMs: 41000}}, requestId: d4e5f60718293a41}
+                typeExhausted:
+                  value: {error: {code: QUESTION_TYPE_EXHAUSTED, message: no hay más preguntas de ese tipo, retryable: false, details: {type: picante}}, requestId: e5f60718293a4b52}
+        '410': {$ref: '#/components/responses/RoomExpired'}
+        '413': {$ref: '#/components/responses/PayloadTooLarge'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '501':
+          description: '`room.reset` no disponible hasta conocer la definición de `reset_game_data`.'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+              example: {error: {code: RESET_NOT_CONFIGURED, message: 'el reinicio de datos no está disponible: falta la definición verificada de reset_game_data', retryable: false}, requestId: f60718293a4b5c63}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+        '500': {$ref: '#/components/responses/InternalError'}
+
+  /api/v1/rooms/{code}/games/current/role:
+    get:
+      tags: [Rooms]
+      operationId: getImpostorRole
+      summary: Rol privado en El Impostor (N8)
+      description: |
+        Solo para el titular del token y solo si participa en la partida indicada (Java `el-impostor/my-role`
+        aceptaba cualquier username). El civil recibe la palabra; el impostor `word: null`.
+      parameters:
+        - $ref: '#/components/parameters/RoomCode'
+        - $ref: '#/components/parameters/EpochQuery'
+        - name: gameRunId
+          in: query
+          required: true
+          schema: {type: string, maxLength: 64}
+      responses:
+        '200':
+          description: Rol propio.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Role'}
+              examples:
+                civil: {value: {gameRunId: 9b4e1c2d-0a3f-4b5c-8d6e-7f8091a2b3c4, role: civil, word: jirafa}}
+                impostor: {value: {gameRunId: 9b4e1c2d-0a3f-4b5c-8d6e-7f8091a2b3c4, role: impostor, word: null}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/RoomNotFound'}
+        '409':
+          description: Sin partida de Impostor (`STATE_CONFLICT`), partida antigua (`STALE_GAME`) o espectador (`ROLE_UNAVAILABLE`).
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+              example: {error: {code: ROLE_UNAVAILABLE, message: 'te uniste después del inicio: eres espectador hasta la próxima partida', retryable: false}, requestId: 0718293a4b5c6d74}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+        '500': {$ref: '#/components/responses/InternalError'}
+
+  /api/v1/rooms/{code}/reconcile:
+    post:
+      tags: [Rooms]
+      operationId: reconcileRoom
+      summary: Materializar deadlines y presencia vencidos (N9)
+      description: |
+        Resuelve una sola vez la votación vencida del Impostor y las transiciones de presencia (reconnecting /
+        salida tras la gracia de 20 s). Idempotente; nunca cambia preguntas.
+      parameters:
+        - $ref: '#/components/parameters/RoomCode'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ReconcileRequest'}
+            example: {epoch: 3f1c2a9e-7b1d-4c2e-9a51-6d8e2f0b4c7a}
+      responses:
+        '200':
+          description: Resultado.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ReconcileResult'}
+              example: {stateVersion: '12', changed: true}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/RoomNotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '410': {$ref: '#/components/responses/RoomExpired'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+        '500': {$ref: '#/components/responses/InternalError'}
+
+  /api/v1/rooms/{code}/connections:
+    post:
+      tags: [Presence]
+      operationId: openConnection
+      summary: Abrir lease de conexión HTTP (N13)
+      description: |
+        Para clientes en modo fallback (sin WebSocket). El lease dura 45 s y se renueva cada 15 s.
+        Máximo 4 conexiones activas por jugador (`409 LIMIT_REACHED`).
+      parameters:
+        - $ref: '#/components/parameters/RoomCode'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/EpochBody'}
+            example: {epoch: 3f1c2a9e-7b1d-4c2e-9a51-6d8e2f0b4c7a}
+      responses:
+        '201':
+          description: Lease abierto.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ConnectionResult'}
+              example: {connectionId: 4e5f6a7b-8c9d-4e0f-a1b2-c3d4e5f60718, leaseUntil: '2026-11-08T12:00:45Z', serverTime: '2026-11-08T12:00:00Z'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/RoomNotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '410': {$ref: '#/components/responses/RoomExpired'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+        '500': {$ref: '#/components/responses/InternalError'}
+
+  /api/v1/rooms/{code}/connections/{id}:
+    put:
+      tags: [Presence]
+      operationId: renewConnection
+      summary: Renovar lease (N14)
+      description: Si el lease ya expiró responde `409 LEASE_NOT_FOUND` y el cliente debe abrir uno nuevo.
+      parameters:
+        - $ref: '#/components/parameters/RoomCode'
+        - $ref: '#/components/parameters/ConnectionId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/EpochBody'}
+            example: {epoch: 3f1c2a9e-7b1d-4c2e-9a51-6d8e2f0b4c7a}
+      responses:
+        '200':
+          description: Lease renovado.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ConnectionResult'}
+              example: {connectionId: 4e5f6a7b-8c9d-4e0f-a1b2-c3d4e5f60718, leaseUntil: '2026-11-08T12:01:00Z', serverTime: '2026-11-08T12:00:15Z'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/RoomNotFound'}
+        '409':
+          description: Lease expirado o ajeno.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+              example: {error: {code: LEASE_NOT_FOUND, message: la conexión expiró; abre una nueva, retryable: false}, requestId: 18293a4b5c6d7e85}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+        '500': {$ref: '#/components/responses/InternalError'}
+    delete:
+      tags: [Presence]
+      operationId: closeConnection
+      summary: Cerrar lease (N15)
+      description: Idempotente. Si era la última conexión empieza la gracia de 20 s (estado `reconnecting`).
+      parameters:
+        - $ref: '#/components/parameters/RoomCode'
+        - $ref: '#/components/parameters/ConnectionId'
+        - $ref: '#/components/parameters/EpochQuery'
+      responses:
+        '204': {description: Lease cerrado (o inexistente).}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/RoomNotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+        '500': {$ref: '#/components/responses/InternalError'}
+
+  /api/v1/realtime:
+    get:
+      tags: [Realtime]
+      operationId: realtime
+      summary: WebSocket JSON v1 (N10)
+      description: |
+        Upgrade WebSocket (WSS en producción). **No lleva credenciales en la URL**: el primer frame, en ≤ 5 s,
+        debe ser `{"v":1,"type":"auth","payload":{"accessToken","roomCode","epoch"}}`. El servidor responde
+        `auth.ok` y después `room.snapshot`, en ese orden. Heartbeat cada 15 s; rotación del servidor a los 270 s
+        con `server.reconnect` + cierre 1012 (Vercel Hobby corta a los 300 s). Frames ≤ 16 KiB.
+        Mensajes, códigos de cierre y garantías: ver `docs/WEBSOCKET.md` y el esquema `WsEnvelope`.
+      security: []
+      parameters:
+        - name: Upgrade
+          in: header
+          required: true
+          schema: {type: string, enum: [websocket]}
+        - name: Origin
+          in: header
+          required: false
+          description: Si está presente debe pertenecer a `ALLOWED_ORIGINS`.
+          schema: {type: string}
+      responses:
+        '101': {description: Switching Protocols — conexión WebSocket establecida.}
+        '403':
+          description: Origin no permitido.
+          content:
+            text/plain:
+              schema: {type: string}
+              example: origin not allowed
+        '429':
+          description: Demasiadas conexiones nuevas desde la misma IP.
+          headers:
+            Retry-After: {$ref: '#/components/headers/Retry-After'}
+          content:
+            text/plain:
+              schema: {type: string}
+              example: too many connections
+
+  /healthz:
+    get:
+      tags: [Operations]
+      operationId: healthz
+      summary: Liveness (N11)
+      description: No consulta la base de datos.
+      security: []
+      responses:
+        '200':
+          description: Proceso vivo.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Health'}
+              example: {status: ok, build: de8ab10}
+
+  /readyz:
+    get:
+      tags: [Operations]
+      operationId: readyz
+      summary: Readiness con base de datos (N12)
+      description: Deshabilitado (404) si no se configura `OPS_HEALTH_TOKEN`. Nunca expone errores internos.
+      security:
+        - opsToken: []
+      responses:
+        '200':
+          description: Base de datos alcanzable.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Readiness'}
+              example: {status: ready}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404':
+          description: Readiness deshabilitado.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+              example: {error: {code: NOT_FOUND, message: ruta no encontrada, retryable: false}, requestId: 293a4b5c6d7e8f96}
+        '503':
+          description: Base de datos no disponible.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Readiness'}
+              example: {status: unavailable}
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque (256 bits, base64url)
+      description: Token emitido por `POST /api/v1/players`. Identifica al jugador; nunca enviarlo en URLs.
+    opsToken:
+      type: http
+      scheme: bearer
+      description: Valor de `OPS_HEALTH_TOKEN` (solo `/readyz`).
+
+  parameters:
+    RoomCode:
+      name: code
+      in: path
+      required: true
+      description: Código público de 4 dígitos.
+      schema: {type: string, pattern: '^[0-9]{4}$'}
+      example: '4821'
+    EpochQuery:
+      name: epoch
+      in: query
+      required: true
+      description: Generación de la sala (los códigos se reutilizan entre generaciones).
+      schema: {type: string, maxLength: 64}
+    ConnectionId:
+      name: id
+      in: path
+      required: true
+      schema: {type: string, maxLength: 64}
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: 16–128 caracteres `[A-Za-z0-9._-]`; usar UUID v4 o 128 bits aleatorios. Reutilizar en reintentos.
+      schema: {type: string, pattern: '^[A-Za-z0-9._-]{16,128}$'}
+
+  headers:
+    X-Request-Id:
+      description: Identificador de la petición (también en el cuerpo de errores).
+      schema: {type: string}
+    Retry-After:
+      description: Segundos a esperar antes de reintentar.
+      schema: {type: integer}
+
+  responses:
+    BadRequest:
+      description: Entrada inválida (`INVALID_INPUT`).
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+          example: {error: {code: INVALID_INPUT, message: JSON inválido o con campos desconocidos, retryable: false}, requestId: 3a4b5c6d7e8f9a07}
+    Unauthorized:
+      description: Falta la credencial o es inválida/expirada (`UNAUTHENTICATED`).
+      headers:
+        WWW-Authenticate:
+          schema: {type: string}
+          example: Bearer realm="bbtronic"
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+          example: {error: {code: UNAUTHENTICATED, message: falta la credencial Bearer, retryable: false}, requestId: 4b5c6d7e8f9a0b18}
+    Forbidden:
+      description: No es miembro, no es anfitrión, no está vivo, u Origin no permitido (`FORBIDDEN`).
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+          example: {error: {code: FORBIDDEN, message: solo el anfitrión puede realizar esta acción, retryable: false}, requestId: 5c6d7e8f9a0b1c29}
+    RoomNotFound:
+      description: La sala no existe o ya cerró (`ROOM_NOT_FOUND`); también jugador inexistente en la sala (`NOT_FOUND`).
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+          example: {error: {code: ROOM_NOT_FOUND, message: la sala no existe o ya cerró, retryable: false}, requestId: 6d7e8f9a0b1c2d3a}
+    Conflict:
+      description: Conflicto de estado o de ámbito (ver códigos 409 en la descripción general).
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+          example: {error: {code: STALE_EPOCH, message: la sala con ese código pertenece a otra generación, retryable: false}, requestId: 7e8f9a0b1c2d3e4b}
+    RoomExpired:
+      description: Sala cerrada por 2 h sin actividad (`ROOM_EXPIRED`; cierre lógico, sin borrado).
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+          example: {error: {code: ROOM_EXPIRED, message: la sala expiró por inactividad, retryable: false}, requestId: 8f9a0b1c2d3e4f5c}
+    PayloadTooLarge:
+      description: Cuerpo mayor que el límite (`PAYLOAD_TOO_LARGE`).
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+          example: {error: {code: PAYLOAD_TOO_LARGE, message: el cuerpo supera el límite permitido, retryable: false}, requestId: 9a0b1c2d3e4f5a6d}
+    TooManyRequests:
+      description: Rate limit local de la instancia (`RATE_LIMITED`).
+      headers:
+        Retry-After: {$ref: '#/components/headers/Retry-After'}
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+          example: {error: {code: RATE_LIMITED, message: demasiadas solicitudes, retryable: true, retryAfterMs: 6000}, requestId: 0b1c2d3e4f5a6b7e}
+    ServiceUnavailable:
+      description: Base de datos no disponible o resultado de commit desconocido (`DATABASE_UNAVAILABLE`). Reintentar con la misma `Idempotency-Key`.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+          example: {error: {code: DATABASE_UNAVAILABLE, message: servicio temporalmente no disponible, retryable: true}, requestId: 1c2d3e4f5a6b7c8f}
+    InternalError:
+      description: Error inesperado y saneado (`INTERNAL_ERROR`); nunca incluye SQL ni detalles internos.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+          example: {error: {code: INTERNAL_ERROR, message: error interno, retryable: false}, requestId: 2d3e4f5a6b7c8d90}
+
+  schemas:
+    ID:
+      type: string
+      pattern: '^[0-9]+$'
+      description: Identificador numérico serializado como string.
+      example: '12'
+    Version:
+      type: string
+      pattern: '^[0-9]+$'
+      example: '18'
+    Timestamp:
+      type: string
+      format: date-time
+    GameKind:
+      type: string
+      enum: [preguntas-directas, yo-nunca-nunca, cultura-pendeja, quien-es-mas-probable, preguntas-incomodas, el-impostor]
+    ErrorCode:
+      type: string
+      enum: [INVALID_INPUT, UNAUTHENTICATED, FORBIDDEN, NOT_FOUND, ROOM_NOT_FOUND, ROOM_EXPIRED, ROOM_FULL, NAME_TAKEN,
+             ALREADY_IN_ROOM, IDEMPOTENCY_KEY_REUSED, STATE_CONFLICT, STALE_EPOCH, STALE_GAME, STALE_ROUND, STALE_QUESTION,
+             WRONG_GAME, ALREADY_VOTED, NO_QUESTIONS, QUESTION_TYPE_EXHAUSTED, CATALOG_EMPTY, ROLE_UNAVAILABLE,
+             COOLDOWN_ACTIVE, LIMIT_REACHED, LEASE_NOT_FOUND, RESET_NOT_CONFIGURED, PAYLOAD_TOO_LARGE, RATE_LIMITED,
+             DATABASE_UNAVAILABLE, INTERNAL_ERROR]
+
+    Error:
+      type: object
+      required: [error, requestId]
+      properties:
+        error: {$ref: '#/components/schemas/ErrorBody'}
+        requestId: {type: string}
+    ErrorBody:
+      type: object
+      required: [code, message, retryable]
+      properties:
+        code: {$ref: '#/components/schemas/ErrorCode'}
+        message: {type: string, description: Mensaje en español apto para mostrar.}
+        retryable: {type: boolean}
+        retryAfterMs: {type: integer, minimum: 0}
+        details:
+          type: object
+          additionalProperties: true
+          description: Datos públicos (p. ej. `currentVersion`, `roomCode`, `type`, `scope`, `maxLength`).
+
+    Player:
+      type: object
+      required: [id, username]
+      properties:
+        id: {$ref: '#/components/schemas/ID'}
+        username: {type: string}
+    RegisterRequest:
+      type: object
+      required: [username]
+      additionalProperties: false
+      properties:
+        username: {type: string, minLength: 1, maxLength: 32}
+    RegisterResponse:
+      type: object
+      required: [player, accessToken, expiresAt]
+      properties:
+        player: {$ref: '#/components/schemas/Player'}
+        accessToken: {type: string, description: Solo se entrega una vez al titular.}
+        expiresAt: {$ref: '#/components/schemas/Timestamp'}
+    RoomRef:
+      type: object
+      required: [code, epoch]
+      properties:
+        code: {type: string}
+        epoch: {type: string}
+    MeResponse:
+      type: object
+      required: [player, room, expiresAt]
+      properties:
+        player: {$ref: '#/components/schemas/Player'}
+        room:
+          anyOf: [{$ref: '#/components/schemas/RoomRef'}, {type: 'null'}]
+        expiresAt: {$ref: '#/components/schemas/Timestamp'}
+    JoinRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        epoch: {type: string, description: Opcional; si se envía debe coincidir con la generación actual.}
+    RoomResult:
+      type: object
+      required: [roomCode, epoch, playerId, stateVersion, participation, replayed]
+      properties:
+        roomCode: {type: string}
+        epoch: {type: string}
+        playerId: {$ref: '#/components/schemas/ID'}
+        stateVersion: {$ref: '#/components/schemas/Version'}
+        participation: {type: string, enum: [player, spectator]}
+        replayed: {type: boolean}
+    EpochBody:
+      type: object
+      required: [epoch]
+      additionalProperties: false
+      properties:
+        epoch: {type: string}
+    ReconcileRequest:
+      type: object
+      required: [epoch]
+      additionalProperties: false
+      properties:
+        epoch: {type: string}
+        gameRunId: {type: string}
+    ReconcileResult:
+      type: object
+      required: [stateVersion, changed]
+      properties:
+        stateVersion: {$ref: '#/components/schemas/Version'}
+        changed: {type: boolean}
+    ConnectionResult:
+      type: object
+      required: [connectionId, leaseUntil, serverTime]
+      properties:
+        connectionId: {type: string}
+        leaseUntil: {$ref: '#/components/schemas/Timestamp'}
+        serverTime: {$ref: '#/components/schemas/Timestamp'}
+        replayed: {type: boolean}
+    Role:
+      type: object
+      required: [gameRunId, role, word]
+      properties:
+        gameRunId: {type: string}
+        role: {type: string, enum: [civil, impostor]}
+        word: {type: [string, 'null']}
+    Health:
+      type: object
+      required: [status, build]
+      properties:
+        status: {type: string, enum: [ok]}
+        build: {type: string}
+    Readiness:
+      type: object
+      required: [status]
+      properties:
+        status: {type: string, enum: [ready, unavailable]}
+
+    CommandRequest:
+      type: object
+      required: [commandId, epoch, operation]
+      additionalProperties: false
+      properties:
+        commandId: {type: string, pattern: '^[A-Za-z0-9._-]{16,128}$', description: 'Igual a `Idempotency-Key`.'}
+        epoch: {type: string, maxLength: 64}
+        gameRunId: {type: string, maxLength: 64, description: Obligatorio cuando la operación afecta al juego activo.}
+        roundId: {type: string, maxLength: 64, description: Obligatorio en Directas para submit/next/checkReady.}
+        expectedVersion:
+          allOf: [{$ref: '#/components/schemas/Version'}]
+          description: Obligatorio en operaciones de anfitrión; opcional en acciones de jugador.
+        operation:
+          type: string
+          enum: [room.activate, room.reset, member.ready, members.resetReady, member.kick, game.start, game.end,
+                 round.new, round.checkReady, question.submit, question.next, vote.submit, vote.call, votes.clear]
+        payload:
+          description: Depende de `operation` (ver tabla de la operación). Objeto estricto.
+          anyOf:
+            - $ref: '#/components/schemas/EmptyPayload'
+            - $ref: '#/components/schemas/MemberReadyPayload'
+            - $ref: '#/components/schemas/KickPayload'
+            - $ref: '#/components/schemas/GameStartPayload'
+            - $ref: '#/components/schemas/QuestionSubmitPayload'
+            - $ref: '#/components/schemas/QuestionNextPayload'
+            - $ref: '#/components/schemas/ProbableVotePayload'
+            - $ref: '#/components/schemas/ImpostorVotePayload'
+            - $ref: '#/components/schemas/VotesClearPayload'
+    EmptyPayload:
+      type: object
+      additionalProperties: false
+      description: room.activate, room.reset, members.resetReady, game.end, round.new, round.checkReady, vote.call.
+    MemberReadyPayload:
+      type: object
+      additionalProperties: false
+      properties:
+        ready: {type: boolean, enum: [true], description: 'Solo `true`; el reset es colectivo (`members.resetReady`).'}
+    KickPayload:
+      type: object
+      required: [playerId]
+      additionalProperties: false
+      properties:
+        playerId: {$ref: '#/components/schemas/ID'}
+    GameStartPayload:
+      type: object
+      required: [game]
+      additionalProperties: false
+      properties:
+        game: {$ref: '#/components/schemas/GameKind'}
+        impostorCount:
+          type: integer
+          minimum: 1
+          default: 1
+          description: Solo `el-impostor`; debe cumplir 1 ≤ k < jugadores.
+    QuestionSubmitPayload:
+      type: object
+      required: [toPlayerId, text, anonymous]
+      additionalProperties: false
+      properties:
+        toPlayerId: {$ref: '#/components/schemas/ID'}
+        text: {type: string, minLength: 1, maxLength: 255}
+        anonymous: {type: boolean}
+    QuestionNextPayload:
+      type: object
+      additionalProperties: false
+      description: '`type` obligatorio en juegos de catálogo (comparación sin distinguir mayúsculas); omitir en Directas.'
+      properties:
+        type: {type: string, minLength: 1, maxLength: 64}
+    ProbableVotePayload:
+      type: object
+      required: [questionInstanceId, targetPlayerId]
+      additionalProperties: false
+      properties:
+        questionInstanceId: {type: string}
+        targetPlayerId: {$ref: '#/components/schemas/ID'}
+    ImpostorVotePayload:
+      type: object
+      required: [votingRoundId, targetPlayerId]
+      additionalProperties: false
+      properties:
+        votingRoundId: {type: string}
+        targetPlayerId: {$ref: '#/components/schemas/ID'}
+    VotesClearPayload:
+      type: object
+      required: [questionInstanceId]
+      additionalProperties: false
+      properties:
+        questionInstanceId: {type: string}
+
+    CommandResult:
+      type: object
+      required: [commandId, operation, committedVersion, replayed, result]
+      properties:
+        commandId: {type: string}
+        operation: {type: string}
+        committedVersion: {$ref: '#/components/schemas/Version'}
+        replayed: {type: boolean, description: true si es la respuesta confirmada de un intento anterior con la misma clave.}
+        result:
+          description: Depende de `operation`. No contiene secretos.
+          anyOf:
+            - {$ref: '#/components/schemas/ActivateResult'}
+            - {$ref: '#/components/schemas/ReadyResult'}
+            - {$ref: '#/components/schemas/ResetReadyResult'}
+            - {$ref: '#/components/schemas/KickResult'}
+            - {$ref: '#/components/schemas/GameStartResult'}
+            - {$ref: '#/components/schemas/GameEndResult'}
+            - {$ref: '#/components/schemas/RoundNewResult'}
+            - {$ref: '#/components/schemas/CheckReadyResult'}
+            - {$ref: '#/components/schemas/QuestionSubmitResult'}
+            - {$ref: '#/components/schemas/QuestionNextResult'}
+            - {$ref: '#/components/schemas/VoteSubmitResult'}
+            - {$ref: '#/components/schemas/VoteCallResult'}
+            - {$ref: '#/components/schemas/VotesClearResult'}
+    ActivateResult:
+      type: object
+      required: [active]
+      properties:
+        active: {type: boolean}
+    ReadyResult:
+      type: object
+      required: [playerId, ready]
+      properties:
+        playerId: {$ref: '#/components/schemas/ID'}
+        ready: {type: boolean}
+    ResetReadyResult:
+      type: object
+      required: [resetCount]
+      properties:
+        resetCount: {type: integer}
+    KickResult:
+      type: object
+      required: [playerId, removed]
+      properties:
+        playerId: {$ref: '#/components/schemas/ID'}
+        removed: {type: boolean}
+    GameStartResult:
+      type: object
+      required: [gameRunId, roundId, phase]
+      properties:
+        gameRunId: {type: string}
+        roundId: {type: [string, 'null']}
+        phase: {$ref: '#/components/schemas/Phase'}
+        countdownEndsAt: {$ref: '#/components/schemas/Timestamp'}
+    GameEndResult:
+      type: object
+      required: [endedGameRunId]
+      properties:
+        endedGameRunId: {type: [string, 'null']}
+    RoundNewResult:
+      type: object
+      required: [roundId, phase]
+      properties:
+        roundId: {type: string}
+        phase: {$ref: '#/components/schemas/Phase'}
+    CheckReadyResult:
+      type: object
+      required: [allReady, pendingPlayerIds, waitingMessage, started]
+      properties:
+        allReady: {type: boolean}
+        pendingPlayerIds: {type: array, items: {$ref: '#/components/schemas/ID'}}
+        waitingMessage: {type: [string, 'null'], description: 'Plantilla de `waiting_messages` con `{usuarios}` sustituido.'}
+        started: {type: boolean, description: true si la ronda de Directas pasó a IN_PROGRESS.}
+    QuestionSubmitResult:
+      type: object
+      required: [questionId]
+      properties:
+        questionId: {$ref: '#/components/schemas/ID'}
+    QuestionNextResult:
+      type: object
+      required: [exhausted]
+      properties:
+        exhausted: {type: boolean}
+        questionId: {$ref: '#/components/schemas/ID'}
+        questionInstanceId: {type: string, description: Solo juegos de catálogo.}
+        number: {type: integer, description: Solo Directas.}
+        total: {type: integer, description: Solo Directas.}
+    VoteSubmitResult:
+      type: object
+      required: [recorded]
+      properties:
+        recorded: {type: boolean}
+        complete: {type: boolean, description: Solo Probable.}
+    VoteCallResult:
+      type: object
+      required: [votingRoundId, deadline]
+      properties:
+        votingRoundId: {type: string}
+        deadline: {$ref: '#/components/schemas/Timestamp'}
+    VotesClearResult:
+      type: object
+      required: [cleared]
+      properties:
+        cleared: {type: boolean}
+
+    Phase:
+      type: string
+      enum: [WAITING_QUESTIONS, IN_PROGRESS, COMPLETED, description, voting]
+      description: Fases de ronda (Directas/catálogos) o del Impostor.
+    Snapshot:
+      type: object
+      required: [v, room, stateVersion, serverTime, players, readiness, game, lastGameResult, presenceObservedAt, reconciliationRequired]
+      properties:
+        v: {type: integer, enum: [1]}
+        room: {$ref: '#/components/schemas/RoomView'}
+        stateVersion: {$ref: '#/components/schemas/Version'}
+        serverTime: {$ref: '#/components/schemas/Timestamp'}
+        players: {type: array, items: {$ref: '#/components/schemas/PlayerView'}}
+        readiness: {$ref: '#/components/schemas/ReadinessView'}
+        game:
+          anyOf: [{$ref: '#/components/schemas/GameView'}, {type: 'null'}]
+          description: null en el lobby.
+        lastGameResult:
+          anyOf: [{$ref: '#/components/schemas/GameResultView'}, {type: 'null'}]
+        presenceObservedAt: {$ref: '#/components/schemas/Timestamp'}
+        reconciliationRequired: {type: boolean, description: 'true → llamar `POST /reconcile` y releer.'}
+    RoomView:
+      type: object
+      required: [code, epoch, hostPlayerId, creatorName, status, activated]
+      properties:
+        code: {type: string}
+        epoch: {type: string}
+        hostPlayerId:
+          anyOf: [{$ref: '#/components/schemas/ID'}, {type: 'null'}]
+          description: null si el anfitrión salió (sin sucesión automática).
+        creatorName: {type: string}
+        status: {type: string, enum: [lobby, active, closed]}
+        activated: {type: boolean, description: 'Java `gameStarted`.'}
+    PlayerView:
+      type: object
+      required: [id, username, ready, isHost, connectionStatus, participation]
+      properties:
+        id: {$ref: '#/components/schemas/ID'}
+        username: {type: string}
+        ready: {type: boolean}
+        isHost: {type: boolean}
+        connectionStatus: {type: string, enum: [online, reconnecting, offline]}
+        participation: {type: string, enum: [player, spectator]}
+    ReadinessView:
+      type: object
+      required: [ready, total, allReady]
+      properties:
+        ready: {type: integer}
+        total: {type: integer}
+        allReady: {type: boolean}
+    GameView:
+      type: object
+      required: [id, kind, roundId, phase, startedAt, deadline, currentQuestion, voting, lastVotingResult]
+      properties:
+        id: {type: string, description: gameRunId.}
+        kind: {$ref: '#/components/schemas/GameKind'}
+        roundId: {type: [string, 'null']}
+        phase: {$ref: '#/components/schemas/Phase'}
+        startedAt: {$ref: '#/components/schemas/Timestamp'}
+        deadline: {type: [string, 'null'], format: date-time, description: Fin de la votación del Impostor.}
+        currentQuestion:
+          anyOf: [{$ref: '#/components/schemas/QuestionView'}, {type: 'null'}]
+        progress: {$ref: '#/components/schemas/ProgressView'}
+        voting:
+          anyOf: [{$ref: '#/components/schemas/VotingView'}, {type: 'null'}]
+        lastVotingResult:
+          anyOf: [{$ref: '#/components/schemas/VotingResultView'}, {type: 'null'}]
+        impostor: {$ref: '#/components/schemas/ImpostorView'}
+    QuestionView:
+      type: object
+      required: [id, text]
+      description: Las preguntas Directas anónimas omiten `fromPlayerName`; `toPlayerId` se omite si el destinatario salió.
+      properties:
+        instanceId: {type: string, description: Juegos de catálogo.}
+        id: {$ref: '#/components/schemas/ID'}
+        type: {type: string, description: Tipo del catálogo.}
+        text: {type: string, description: 'Texto con `{player}` ya sustituido.'}
+        fromPlayerName: {type: string}
+        toPlayerId: {$ref: '#/components/schemas/ID'}
+        toPlayerName: {type: string}
+        anonymous: {type: boolean}
+        number: {type: integer}
+        total: {type: integer}
+    ProgressView:
+      type: object
+      required: [totalQuestions, shownQuestions]
+      properties:
+        totalQuestions: {type: integer, description: Directas.}
+        shownQuestions: {type: integer, description: Directas.}
+        remaining: {type: integer, description: Catálogos.}
+        remainingByType: {type: object, additionalProperties: {type: integer}, description: Catálogos.}
+    VoteCount:
+      type: object
+      required: [playerId, votes]
+      properties:
+        playerId: {$ref: '#/components/schemas/ID'}
+        votes: {type: integer}
+    VotingView:
+      type: object
+      required: [scopeId, votedCount, totalVoters, pendingPlayerIds, complete]
+      description: Probable incluye `counts`/`leaderPlayerId` parciales y `winnerPlayerId` al completar (empate → menor ID). El Impostor nunca expone conteos antes de resolver.
+      properties:
+        scopeId: {type: string, description: questionInstanceId (Probable) o votingRoundId (Impostor).}
+        votedCount: {type: integer}
+        totalVoters: {type: integer}
+        pendingPlayerIds: {type: array, items: {$ref: '#/components/schemas/ID'}}
+        complete: {type: boolean}
+        counts: {type: array, items: {$ref: '#/components/schemas/VoteCount'}}
+        leaderPlayerId: {$ref: '#/components/schemas/ID'}
+        winnerPlayerId: {$ref: '#/components/schemas/ID'}
+        deadline: {$ref: '#/components/schemas/Timestamp'}
+    VotingResultView:
+      type: object
+      required: [resultId, scopeId, counts, tie, reason, resolvedAt]
+      properties:
+        resultId: {type: string, description: Mostrar cada resultado una sola vez.}
+        scopeId: {type: string}
+        counts: {type: array, items: {$ref: '#/components/schemas/VoteCount'}}
+        tie: {type: boolean}
+        winnerPlayerId: {$ref: '#/components/schemas/ID'}
+        winnerName: {type: string}
+        eliminatedPlayerId: {$ref: '#/components/schemas/ID'}
+        eliminatedName: {type: string}
+        reason: {type: string, enum: [all-voted, timeout]}
+        pendingAtClose: {type: array, items: {$ref: '#/components/schemas/ID'}}
+        resolvedAt: {$ref: '#/components/schemas/Timestamp'}
+    ImpostorView:
+      type: object
+      required: [impostorCount, participantIds, alivePlayerIds, eliminatedPlayerIds, countdownEndsAt, votingRoundId,
+                 lastVotingCalledBy, lastVotingCalledAt, lastVotingEndedAt, globalCooldownUntil, personalCooldowns]
+      description: Público. Sin palabra, sin lista de impostores, sin historial de palabras.
+      properties:
+        impostorCount: {type: integer}
+        participantIds: {type: array, items: {$ref: '#/components/schemas/ID'}}
+        alivePlayerIds: {type: array, items: {$ref: '#/components/schemas/ID'}}
+        eliminatedPlayerIds: {type: array, items: {$ref: '#/components/schemas/ID'}}
+        countdownEndsAt: {$ref: '#/components/schemas/Timestamp'}
+        votingRoundId: {type: [string, 'null']}
+        lastVotingCalledBy:
+          anyOf: [{$ref: '#/components/schemas/ID'}, {type: 'null'}]
+        lastVotingCalledAt: {type: [string, 'null'], format: date-time}
+        lastVotingEndedAt: {type: [string, 'null'], format: date-time}
+        globalCooldownUntil: {type: [string, 'null'], format: date-time}
+        personalCooldowns:
+          type: array
+          items:
+            type: object
+            required: [playerId, availableAt]
+            properties:
+              playerId: {$ref: '#/components/schemas/ID'}
+              availableAt: {$ref: '#/components/schemas/Timestamp'}
+        lastDeparture:
+          type: object
+          required: [playerId, reason, at]
+          properties:
+            playerId: {$ref: '#/components/schemas/ID'}
+            reason: {type: string, enum: [left, kicked, disconnect]}
+            at: {$ref: '#/components/schemas/Timestamp'}
+    GameResultView:
+      type: object
+      required: [resultId, gameRunId, kind, winner, impostorPlayerIds, impostors, message, finalVoting, endedAt]
+      properties:
+        resultId: {type: string}
+        gameRunId: {type: string}
+        kind: {$ref: '#/components/schemas/GameKind'}
+        winner: {type: string, enum: [civilians, impostors]}
+        impostorPlayerIds: {type: array, items: {$ref: '#/components/schemas/ID'}}
+        impostors:
+          type: array
+          items:
+            type: object
+            required: [id, name]
+            properties:
+              id: {$ref: '#/components/schemas/ID'}
+              name: {type: string}
+        message: {type: string}
+        finalVoting:
+          anyOf: [{$ref: '#/components/schemas/VotingResultView'}, {type: 'null'}]
+        endedAt: {$ref: '#/components/schemas/Timestamp'}
+
+    WsEnvelope:
+      type: object
+      description: |
+        Frame WebSocket (ambas direcciones). Cliente → servidor: `auth`, `heartbeat`, `state.request`, `command`.
+        Servidor → cliente: `auth.ok`, `room.snapshot` (payload `{state: Snapshot}`), `heartbeat.ack`,
+        `command.result` (payload `CommandResult`), `error` (payload `{error: ErrorBody}`), `server.reconnect`,
+        `access.revoked`. Cierres: 1008 credencial inválida/revocada (no reconectar), 1009 frame grande,
+        1012 rotación/apagado, 1013 BD no disponible, 4000 cliente lento, 4001 sin heartbeat, 4002 auth tardía.
+      required: [v, type]
+      properties:
+        v: {type: integer, enum: [1]}
+        type:
+          type: string
+          enum: [auth, auth.ok, state.request, room.snapshot, heartbeat, heartbeat.ack, command, command.result, error, server.reconnect, access.revoked]
+        requestId: {type: string}
+        eventId: {type: string, description: '`epoch:stateVersion` (room.snapshot).'}
+        roomCode: {type: string}
+        epoch: {type: string}
+        stateVersion: {$ref: '#/components/schemas/Version'}
+        reason: {type: string, description: Ayuda de UI del snapshot; no es fuente de verdad.}
+        payload: {type: object, additionalProperties: true}
+      example: {v: 1, type: auth, requestId: r1, payload: {accessToken: q3V8d1Yv0m3c2pZ4nH7sL9tKfR2xW5bA6eJ1gU8yQ0o, roomCode: '4821', epoch: 3f1c2a9e-7b1d-4c2e-9a51-6d8e2f0b4c7a}}
+
+  examples:
+    SnapshotLobby:
+      summary: Lobby con dos jugadores
+      value:
+        v: 1
+        room: {code: '4821', epoch: 3f1c2a9e-7b1d-4c2e-9a51-6d8e2f0b4c7a, hostPlayerId: '12', creatorName: Ana, status: lobby, activated: false}
+        stateVersion: '3'
+        serverTime: '2026-11-08T12:00:00Z'
+        players:
+          - {id: '12', username: Ana, ready: true, isHost: true, connectionStatus: online, participation: player}
+          - {id: '13', username: Beto, ready: false, isHost: false, connectionStatus: reconnecting, participation: player}
+        readiness: {ready: 1, total: 2, allReady: false}
+        game: null
+        lastGameResult: null
+        presenceObservedAt: '2026-11-08T12:00:00Z'
+        reconciliationRequired: false
+    SnapshotDirectas:
+      summary: Preguntas Directas en curso con pregunta anónima
+      value:
+        v: 1
+        room: {code: '4821', epoch: 3f1c2a9e-7b1d-4c2e-9a51-6d8e2f0b4c7a, hostPlayerId: '12', creatorName: Ana, status: active, activated: true}
+        stateVersion: '11'
+        serverTime: '2026-11-08T12:05:00Z'
+        players:
+          - {id: '12', username: Ana, ready: true, isHost: true, connectionStatus: online, participation: player}
+          - {id: '13', username: Beto, ready: true, isHost: false, connectionStatus: online, participation: player}
+        readiness: {ready: 2, total: 2, allReady: true}
+        game:
+          id: 9b4e1c2d-0a3f-4b5c-8d6e-7f8091a2b3c4
+          kind: preguntas-directas
+          roundId: 1c2d3e4f-5a6b-4c7d-8e9f-0a1b2c3d4e5f
+          phase: IN_PROGRESS
+          startedAt: '2026-11-08T12:01:00Z'
+          deadline: null
+          currentQuestion: {id: '77', text: ¿Cuál fue tu peor cita?, toPlayerId: '13', toPlayerName: Beto, anonymous: true, number: 1, total: 3}
+          progress: {totalQuestions: 3, shownQuestions: 1}
+          voting: null
+          lastVotingResult: null
+        lastGameResult: null
+        presenceObservedAt: '2026-11-08T12:05:00Z'
+        reconciliationRequired: false
+    SnapshotImpostorVoting:
+      summary: El Impostor durante una votación
+      value:
+        v: 1
+        room: {code: '4821', epoch: 3f1c2a9e-7b1d-4c2e-9a51-6d8e2f0b4c7a, hostPlayerId: '12', creatorName: Ana, status: active, activated: true}
+        stateVersion: '25'
+        serverTime: '2026-11-08T12:10:20Z'
+        players:
+          - {id: '12', username: Ana, ready: false, isHost: true, connectionStatus: online, participation: player}
+          - {id: '13', username: Beto, ready: false, isHost: false, connectionStatus: online, participation: player}
+          - {id: '14', username: Caro, ready: false, isHost: false, connectionStatus: online, participation: player}
+          - {id: '15', username: Dani, ready: false, isHost: false, connectionStatus: online, participation: spectator}
+        readiness: {ready: 0, total: 4, allReady: false}
+        game:
+          id: 9b4e1c2d-0a3f-4b5c-8d6e-7f8091a2b3c4
+          kind: el-impostor
+          roundId: null
+          phase: voting
+          startedAt: '2026-11-08T12:08:00Z'
+          deadline: '2026-11-08T12:11:00Z'
+          currentQuestion: null
+          voting: {scopeId: 2d3e4f5a-6b7c-4d8e-9f0a-1b2c3d4e5f60, votedCount: 1, totalVoters: 3, pendingPlayerIds: ['13', '14'], complete: false, deadline: '2026-11-08T12:11:00Z'}
+          lastVotingResult: null
+          impostor:
+            impostorCount: 1
+            participantIds: ['12', '13', '14']
+            alivePlayerIds: ['12', '13', '14']
+            eliminatedPlayerIds: []
+            countdownEndsAt: '2026-11-08T12:08:03Z'
+            votingRoundId: 2d3e4f5a-6b7c-4d8e-9f0a-1b2c3d4e5f60
+            lastVotingCalledBy: '12'
+            lastVotingCalledAt: '2026-11-08T12:10:00Z'
+            lastVotingEndedAt: null
+            globalCooldownUntil: null
+            personalCooldowns: [{playerId: '12', availableAt: '2026-11-08T12:12:00Z'}]
+        lastGameResult: null
+        presenceObservedAt: '2026-11-08T12:10:20Z'
+        reconciliationRequired: false

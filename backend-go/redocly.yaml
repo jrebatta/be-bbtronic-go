@@ -1,0 +1,9 @@
+# Lint: npx @redocly/cli@2 lint docs/swagger.yml
+extends:
+  - recommended
+rules:
+  info-license: off            # proyecto privado sin licencia publicada
+  no-server-example.com: off   # el servidor localhost es el entorno de desarrollo documentado
+  operation-2xx-response: off  # GET /api/v1/realtime responde 101 Switching Protocols
+  operation-4xx-response: off  # /healthz no tiene respuestas de error por diseño
+  no-unused-components: off    # WsEnvelope documenta los frames WebSocket (no modelables en OpenAPI)
