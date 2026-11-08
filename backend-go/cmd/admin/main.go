@@ -22,6 +22,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/jrebatta/be-bbtronic-go/backend-go/internal/config"
 	"github.com/jrebatta/be-bbtronic-go/backend-go/internal/store"
 )
 
@@ -35,6 +36,9 @@ func main() {
 func run(args []string) error {
 	if len(args) == 0 {
 		return errors.New("usage: admin <inspect-schema|migrate|seed-catalogs|list-players|purge-receipts> [flags]")
+	}
+	if _, err := config.LoadDotEnv(".env"); err != nil {
+		return err
 	}
 	cmd, rest := args[0], args[1:]
 	fs := flag.NewFlagSet(cmd, flag.ContinueOnError)

@@ -25,6 +25,11 @@ func main() {
 }
 
 func run() error {
+	// Local development: backend-go/.env (ignored by git). On Vercel there is
+	// no such file and the dashboard variables are used.
+	if _, err := config.LoadDotEnv(".env"); err != nil {
+		return err
+	}
 	cfg, err := config.FromEnv()
 	if err != nil {
 		return err
