@@ -14,6 +14,7 @@ import (
 	"crypto/rand"
 	_ "embed"
 	"encoding/hex"
+	"net"
 	"net/url"
 	"os"
 	"testing"
@@ -47,7 +48,7 @@ func New(t testing.TB) *DB {
 	if err != nil {
 		t.Fatalf("%s is not a URL", EnvVar)
 	}
-	if h := u.Hostname(); h != "127.0.0.1" && h != "localhost" && h != "::1" {
+	if h := u.Hostname(); !localHost(h) {
 		t.Fatalf("%s must point to a local server, got host %q: refusing to run", EnvVar, h)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -99,6 +100,19 @@ func New(t testing.TB) *DB {
 		t.Fatalf("migrating: %v", err)
 	}
 	return &DB{Store: st, URL: dbURL.String()}
+}
+
+// localHost accepts loopback hosts, plus private RFC 1918 addresses only when
+// BBTRONIC_TEST_DB_ALLOW_PRIVATE=1 (e.g. a test cluster reached from WSL).
+func localHost(h string) bool {
+	if h == "127.0.0.1" || h == "localhost" || h == "::1" {
+		return true
+	}
+	if os.Getenv("BBTRONIC_TEST_DB_ALLOW_PRIVATE") != "1" {
+		return false
+	}
+	ip := net.ParseIP(h)
+	return ip != nil && ip.IsPrivate()
 }
 
 // Exec runs SQL on the test database (fixtures).

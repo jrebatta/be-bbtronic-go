@@ -54,6 +54,11 @@ func New(ctx context.Context, cfg config.Config, log *slog.Logger) (*App, error)
 
 // Wire assembles the components around an existing store.
 func Wire(st *store.Store, cfg config.Config, log *slog.Logger) *App {
+	return WireWith(st, cfg, log, nil)
+}
+
+// WireWith is Wire with a hook to adjust the realtime configuration (tests).
+func WireWith(st *store.Store, cfg config.Config, log *slog.Logger, tune func(*realtime.Config)) *App {
 	ccfg := coordinator.DefaultConfig()
 	ccfg.TokenTTL = cfg.TokenTTL
 	ccfg.DisconnectGrace = cfg.DisconnectGrace
@@ -72,6 +77,9 @@ func Wire(st *store.Store, cfg config.Config, log *slog.Logger) *App {
 	rcfg.HeartbeatTimeout = cfg.PresenceLease
 	rcfg.PollActive = cfg.PollActive
 	rcfg.PollLobby = cfg.PollLobby
+	if tune != nil {
+		tune(&rcfg)
+	}
 	hub := realtime.NewHub(svc, rcfg, log)
 
 	opts := httpapi.Options{
