@@ -108,6 +108,10 @@ type State struct {
 	// ImpostorUsedWords is the room-level private word history (Java
 	// sessionUsedWords). It survives game.end and is reset when exhausted.
 	ImpostorUsedWords []string `json:"impostorUsedWords,omitempty"`
+	// ClosedCode keeps the public code of a closed room: session_code is set
+	// to NULL on close so the code can be reused under the real database's
+	// UNIQUE index on game_session.session_code (rooms are never deleted).
+	ClosedCode string `json:"closedCode,omitempty"`
 }
 
 // Game is the active game run. Exactly one of the kind-specific pointers is set.

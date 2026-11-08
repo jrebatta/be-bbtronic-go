@@ -41,10 +41,37 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS disconnected_at timestamptz;
 
 CREATE UNIQUE INDEX IF NOT EXISTS users_token_hash_key ON users (token_hash) WHERE token_hash IS NOT NULL;
 
--- Relation/query indexes (plan 8.2). Non-unique: duplicates are not presumed absent.
-CREATE INDEX IF NOT EXISTS users_game_session_id_idx ON users (game_session_id);
-CREATE INDEX IF NOT EXISTS question_session_round_idx ON question (game_session_id, round_id, id);
-CREATE INDEX IF NOT EXISTS shown_questions_session_idx ON shown_questions (session_id, question_id);
+-- Relation/query indexes (plan 8.2). Non-unique. Created only when no index
+-- with the same leading columns exists: the real database (inspected
+-- 2026-11-08) already has idx_users_game_session, idx_question_session_round
+-- and idx_shown_questions_session, so no duplicates are added there.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_index i
+        WHERE i.indrelid = 'users'::regclass
+          AND i.indkey[0] = (SELECT attnum FROM pg_attribute WHERE attrelid = 'users'::regclass AND attname = 'game_session_id')
+    ) THEN
+        CREATE INDEX users_game_session_id_idx ON users (game_session_id);
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_index i
+        WHERE i.indrelid = 'question'::regclass
+          AND i.indkey[0] = (SELECT attnum FROM pg_attribute WHERE attrelid = 'question'::regclass AND attname = 'game_session_id')
+          AND i.indkey[1] = (SELECT attnum FROM pg_attribute WHERE attrelid = 'question'::regclass AND attname = 'round_id')
+    ) THEN
+        CREATE INDEX question_session_round_idx ON question (game_session_id, round_id, id);
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_index i
+        WHERE i.indrelid = 'shown_questions'::regclass
+          AND i.indkey[0] = (SELECT attnum FROM pg_attribute WHERE attrelid = 'shown_questions'::regclass AND attname = 'session_id')
+    ) THEN
+        CREATE INDEX shown_questions_session_idx ON shown_questions (session_id, question_id);
+    END IF;
+END $$;
 
 -- Idempotency receipts: the only new infrastructure table (plan 5.3). No FK to
 -- users so a receipt survives the actor being kicked/removed.

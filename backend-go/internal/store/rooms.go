@@ -198,7 +198,9 @@ func (t *Tx) InsertRoom(ctx context.Context, r *game.Room) (bool, error) {
 // CloseIdleRoomWithCode logically closes an expired room holding code so the
 // code can be reused (rooms are never deleted).
 func (t *Tx) CloseIdleRoomWithCode(ctx context.Context, code string, idleBefore time.Time) error {
-	_, err := t.tx.Exec(ctx, `UPDATE game_session SET closed_at = now()
+	// session_code is released (NULL) and kept in runtime_state.closedCode.
+	_, err := t.tx.Exec(ctx, `UPDATE game_session SET closed_at = now(), session_code = NULL,
+			runtime_state = jsonb_set(COALESCE(runtime_state, '{}'::jsonb), '{closedCode}', to_jsonb(session_code))
 		WHERE session_code = $1 AND `+activeRoom+` AND COALESCE(last_activity_at, created_at) < $2`, code, idleBefore)
 	if err != nil {
 		return fmt.Errorf("closing idle room: %w", err)
@@ -209,6 +211,12 @@ func (t *Tx) CloseIdleRoomWithCode(ctx context.Context, code string, idleBefore 
 // SaveRoom writes the room row. Legacy columns are mirrored from the runtime
 // state (single source of truth) so the data stays readable.
 func (t *Tx) SaveRoom(ctx context.Context, r *game.Room) error {
+	code := &r.Code
+	if r.ClosedAt != nil {
+		// Release the public code (UNIQUE index in the real DB); keep it in state.
+		r.State.ClosedCode = r.Code
+		code = nil
+	}
 	state, err := json.Marshal(r.State)
 	if err != nil {
 		return fmt.Errorf("encoding state: %w", err)
@@ -227,10 +235,10 @@ func (t *Tx) SaveRoom(ctx context.Context, r *game.Room) error {
 	_, err = t.tx.Exec(ctx, `UPDATE game_session SET
 		host_user_id = $2, game_started = $3, state_version = $4, state_schema_version = $5,
 		runtime_state = $6, current_game = $7, current_round_id = $8, round_status = $9,
-		next_deadline_at = $10, last_activity_at = $11, closed_at = $12
+		next_deadline_at = $10, last_activity_at = $11, closed_at = $12, session_code = $13
 		WHERE id = $1`,
 		r.ID, r.HostID, r.Activated, r.Version, game.StateSchemaVersion, state, curGame, roundID, roundStatus,
-		r.NextDeadline(), r.LastActive, r.ClosedAt)
+		r.NextDeadline(), r.LastActive, r.ClosedAt, code)
 	if err != nil {
 		return fmt.Errorf("saving room %d: %w", r.ID, err)
 	}

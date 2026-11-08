@@ -185,7 +185,7 @@ func TestLogout(t *testing.T) {
 	if err := h.svc.Logout(ctx, ps[1].Actor); err != nil {
 		t.Fatal(err)
 	}
-	if n := h.db.Count(t, `SELECT count(*) FROM game_session WHERE session_code = $1 AND closed_at IS NOT NULL`, r.code); n != 1 {
+	if n := h.db.Count(t, `SELECT count(*) FROM game_session WHERE session_code IS NULL AND runtime_state->>'closedCode' = $1 AND closed_at IS NOT NULL`, r.code); n != 1 {
 		t.Fatal("empty room must be closed, not deleted")
 	}
 }
@@ -283,7 +283,7 @@ func TestLegacyRowsAndExpiry(t *testing.T) {
 	if !game.IsCode(err, game.CodeRoomExpired) {
 		t.Fatalf("idle room: %v", err)
 	}
-	if n := h.db.Count(t, `SELECT count(*) FROM game_session WHERE session_code = $1 AND closed_at IS NOT NULL`, r.code); n != 1 {
+	if n := h.db.Count(t, `SELECT count(*) FROM game_session WHERE session_code IS NULL AND runtime_state->>'closedCode' = $1 AND closed_at IS NOT NULL`, r.code); n != 1 {
 		t.Fatal("expiry must be committed as a logical close")
 	}
 	// Members of the closed room may create a new one.
@@ -294,4 +294,36 @@ func TestLegacyRowsAndExpiry(t *testing.T) {
 
 func (h *harness) requestNoState(r room, op, ver string) coordinator.CommandRequest {
 	return coordinator.CommandRequest{CommandID: h.key(), Epoch: r.epoch, Operation: op, ExpectedVersion: &ver}
+}
+
+// fixedRand always draws the same value: every room gets the same code.
+type fixedRand struct{}
+
+func (fixedRand) IntN(n int) int { return 821 % n }
+
+// The real database has UNIQUE(session_code): closing a room releases its
+// code (session_code = NULL, kept in runtime_state.closedCode) so it can be
+// reused without deleting rooms.
+func TestClosedRoomReleasesCode(t *testing.T) {
+	h := newHarness(t)
+	h.svc.SetRand(fixedRand{})
+	ana := h.register("ana")
+	first := h.createRoom(ana)
+	if first.code != "1821" {
+		t.Fatalf("code %s", first.code)
+	}
+	beto := h.register("beto")
+	if _, err := h.svc.CreateRoom(context.Background(), beto.Actor, h.key()); !game.IsCode(err, game.CodeLimitReached) {
+		t.Fatalf("a code held by an active room must not be reused: %v", err)
+	}
+	if err := h.svc.Logout(context.Background(), h.refresh(ana).Actor); err != nil { // last member leaves → room closed
+		t.Fatal(err)
+	}
+	second := h.createRoom(beto)
+	if second.code != first.code || second.epoch == first.epoch {
+		t.Fatalf("released code must be reusable by a new generation: %+v %+v", first, second)
+	}
+	if n := h.db.Count(t, `SELECT count(*) FROM game_session WHERE runtime_state->>'closedCode' = '1821' AND session_code IS NULL`); n != 1 {
+		t.Fatal("closed room must keep its code in runtime_state")
+	}
 }
