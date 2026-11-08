@@ -69,7 +69,7 @@ func (s *seqRand) IntN(n int) int {
 }
 
 type fixture struct {
-	t    *testing.T
+	t    testing.TB
 	room *Room
 	data *fakeData
 	rnd  *seqRand
@@ -77,7 +77,7 @@ type fixture struct {
 	ids  int
 }
 
-func newFixture(t *testing.T, names ...string) *fixture {
+func newFixture(t testing.TB, names ...string) *fixture {
 	t.Helper()
 	f := &fixture{t: t, data: newFakeData(), rnd: &seqRand{}, now: time.Date(2026, 11, 8, 12, 0, 0, 0, time.UTC)}
 	host := int64(1)

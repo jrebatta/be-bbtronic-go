@@ -209,6 +209,7 @@ func (h *Hub) cycle() error {
 			continue
 		}
 		if h.svc.Due(head) {
+			h.log.Debug("realtime reconcile due room", "room", id, "version", head.Version)
 			if _, err := h.svc.ReconcileRoom(ctx, id); err != nil {
 				h.log.Warn("reconcile failed", "room", id, "err", err)
 			}
@@ -266,6 +267,7 @@ func (h *Hub) push(ctx context.Context, roomID int64) error {
 		}
 	}
 	h.mu.Unlock()
+	h.log.Debug("realtime push", "room", roomID, "version", snap.Version, "targets", len(targets), "reason", reason)
 	for _, c := range targets {
 		switch {
 		case !snap.Members[c.actor.PlayerID]:

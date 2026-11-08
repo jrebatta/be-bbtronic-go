@@ -34,17 +34,25 @@ func (t *Tx) GetReceipt(ctx context.Context, scope string, actorID int64, keyHas
 
 // PutReceipt stores a receipt in the same transaction as the effect. An
 // expired receipt with the same key is replaced.
+//
+// One round trip: an existing row is only overwritten when it has expired; a
+// live receipt is never replaced (the caller already replayed it under the
+// room/user lock, so reaching the conflict branch with a live row is a bug).
 func (t *Tx) PutReceipt(ctx context.Context, scope string, actorID int64, keyHash []byte, r Receipt, now, expires time.Time) error {
-	if _, err := t.tx.Exec(ctx, `DELETE FROM operation_receipt
-		WHERE scope = $1 AND actor_id = $2 AND key_hash = $3 AND expires_at <= $4`, scope, actorID, keyHash, now); err != nil {
-		return fmt.Errorf("replacing expired receipt: %w", err)
-	}
-	_, err := t.tx.Exec(ctx, `INSERT INTO operation_receipt
+	tag, err := t.tx.Exec(ctx, `INSERT INTO operation_receipt AS o
 		(scope, actor_id, key_hash, request_hash, operation, committed_version, result, created_at, expires_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		ON CONFLICT ON CONSTRAINT operation_receipt_scope_actor_key DO UPDATE SET
+			request_hash = EXCLUDED.request_hash, operation = EXCLUDED.operation,
+			committed_version = EXCLUDED.committed_version, result = EXCLUDED.result,
+			created_at = EXCLUDED.created_at, expires_at = EXCLUDED.expires_at
+		WHERE o.expires_at <= EXCLUDED.created_at`,
 		scope, actorID, keyHash, r.RequestHash, r.Operation, r.CommittedVersion, r.Result, now, expires)
 	if err != nil {
 		return fmt.Errorf("writing receipt: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("writing receipt: a live receipt already exists for this key")
 	}
 	return nil
 }

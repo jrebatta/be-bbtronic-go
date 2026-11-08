@@ -613,20 +613,31 @@ func (s *Service) Execute(ctx context.Context, a Actor, code string, req Command
 					Details: map[string]any{"currentVersion": strconv.FormatInt(current, 10)}})
 			}
 		}
-		pre, err := room.Clone()
-		if err != nil {
-			return err
-		}
 		cmd := game.Command{Operation: req.Operation, GameRunID: req.GameRunID, RoundID: req.RoundID, Payload: req.Payload}
 		var out game.Outcome
-		applyErr := tx.Savepoint(ctx, func() error {
-			var err error
-			out, err = game.Apply(ctx, env, room, a.PlayerID, cmd)
-			return err
-		})
-		if applyErr != nil {
-			room = pre
-			return fail(applyErr)
+		if !advanced {
+			// Nothing to keep on failure: the whole transaction rolls back.
+			// Skipping SAVEPOINT/RELEASE saves two round trips per command
+			// (BenchmarkExecute, see MIGRATION_PROGRESS.md).
+			if out, err = game.Apply(ctx, env, room, a.PlayerID, cmd); err != nil {
+				return err
+			}
+		} else {
+			// A reconciliation must be committed even if the command fails:
+			// isolate the command's own SQL effects in a savepoint.
+			pre, err := room.Clone()
+			if err != nil {
+				return err
+			}
+			applyErr := tx.Savepoint(ctx, func() error {
+				var err error
+				out, err = game.Apply(ctx, env, room, a.PlayerID, cmd)
+				return err
+			})
+			if applyErr != nil {
+				room = pre
+				return fail(applyErr)
+			}
 		}
 		if out.Changed || advanced {
 			room.Version++

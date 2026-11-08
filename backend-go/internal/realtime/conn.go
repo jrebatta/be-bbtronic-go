@@ -138,12 +138,21 @@ func (h *Hub) serve(ws *websocket.Conn) {
 		c.writeLoop()
 		return
 	}
-	c.send(encode(TypeAuthOK, Envelope{RequestID: env.RequestID}, map[string]any{
+	// auth.ok must precede every other frame (plan 7.2). The writer goroutine
+	// is not running yet, so this direct write is the only writer; going
+	// through the queue would race with the snapshot signal in its select.
+	okFrame := encode(TypeAuthOK, Envelope{RequestID: env.RequestID}, map[string]any{
 		"connectionId": lease.ConnectionID, "roomCode": mc.RoomCode, "epoch": mc.Epoch,
 		"stateVersion": versionString(mc.StateVersion), "serverTime": lease.ServerTime,
 		"leaseUntil": lease.LeaseUntil, "playerId": game.FormatID(actor.PlayerID),
 		"rotateAfterSeconds": int(h.cfg.RotateAfter / time.Second), "leaseRenewalSeconds": int(h.cfg.LeaseRenew / time.Second),
-	}))
+	})
+	wctx, wcancel := context.WithTimeout(ctx, 5*time.Second)
+	err = ws.Write(wctx, websocket.MessageText, okFrame)
+	wcancel()
+	if err != nil {
+		return
+	}
 	// Registered before loading: commits during the load mark the room dirty
 	// and the watcher re-checks the revision (plan 7.3).
 	if err := c.sendFreshSnapshot("sync"); err != nil {

@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -38,7 +39,7 @@ func testConfig() config.Config {
 	return config.Config{
 		AppEnv: config.EnvTest, PGQueryTO: 5 * time.Second, TokenTTL: time.Hour, RealtimeMode: "websocket",
 		AllowedOrigins: []string{allowedOrigin}, PollActive: 150 * time.Millisecond, PollLobby: 200 * time.Millisecond,
-		WSRotate: time.Minute, PresenceRenew: time.Second, PresenceLease: 3 * time.Second, DisconnectGrace: time.Second,
+		WSRotate: time.Minute, PresenceRenew: time.Second, PresenceLease: 15 * time.Second, DisconnectGrace: time.Second,
 		RoomIdle: time.Hour, ReceiptRetention: time.Hour, MaxConnsPerUser: 4, MaxRoomMembers: 30,
 		HTTPBodyLimit: 64 << 10, WSFrameLimit: 16 << 10, BuildID: "e2e",
 	}
@@ -46,7 +47,11 @@ func testConfig() config.Config {
 
 func newInstance(t *testing.T, db *testdb.DB, tune func(*realtime.Config)) *instance {
 	t.Helper()
-	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	var out io.Writer = io.Discard
+	if os.Getenv("BBTRONIC_TEST_LOG") == "1" {
+		out = os.Stderr
+	}
+	log := slog.New(slog.NewTextHandler(out, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	a := app.WireWith(db.Store, testConfig(), log, tune)
 	srv := httptest.NewServer(a.Handler)
 	t.Cleanup(func() {
@@ -225,8 +230,14 @@ func connectWS(t *testing.T, inst *instance, c *client, r roomRef) (*wsClient, f
 	t.Cleanup(func() { conn.CloseNow() })
 	ws.send(map[string]any{"v": 1, "type": "auth", "requestId": "auth-1",
 		"payload": map[string]string{"accessToken": c.token, "roomCode": r.Code, "epoch": r.Epoch}})
-	ok := ws.expect("auth.ok", 5*time.Second)
-	ws.expect("room.snapshot", 5*time.Second)
+	// Protocol order is strict (plan 7.2): auth.ok first, then room.snapshot.
+	ok, err := ws.read(5 * time.Second)
+	if err != nil || ok.Type != "auth.ok" {
+		t.Fatalf("first frame must be auth.ok, got %q (%v)", ok.Type, err)
+	}
+	if snap, err := ws.read(5 * time.Second); err != nil || snap.Type != "room.snapshot" {
+		t.Fatalf("second frame must be room.snapshot, got %q (%v)", snap.Type, err)
+	}
 	return ws, ok
 }
 

@@ -19,7 +19,7 @@ import (
 )
 
 type harness struct {
-	t   *testing.T
+	t   testing.TB
 	db  *testdb.DB
 	svc *coordinator.Service
 
