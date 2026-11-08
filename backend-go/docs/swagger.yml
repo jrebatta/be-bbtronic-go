@@ -21,7 +21,7 @@ info:
     El tiempo real usa WebSocket (`GET /api/v1/realtime`); su protocolo de mensajes está descrito en
     `docs/WEBSOCKET.md` y resumido en el esquema `WsEnvelope`.
 servers:
-  - url: http://localhost:8080
+  - url: http://localhost:8081
     description: Desarrollo local
   - url: https://{deployment}.vercel.app
     description: Despliegue en Vercel (Preview/Production)

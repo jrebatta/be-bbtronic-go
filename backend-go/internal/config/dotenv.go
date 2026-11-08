@@ -6,8 +6,31 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"strings"
 )
+
+// LoadLocalDotEnv loads the first .env found in the working directory, next
+// to the executable, or in the executable's parent directory (bin/..). It
+// returns the file used ("" when none exists).
+func LoadLocalDotEnv() (string, error) {
+	candidates := []string{".env"}
+	if exe, err := os.Executable(); err == nil {
+		dir := filepath.Dir(exe)
+		candidates = append(candidates, filepath.Join(dir, ".env"), filepath.Join(dir, "..", ".env"))
+	}
+	for _, p := range candidates {
+		if _, err := os.Stat(p); err != nil {
+			continue
+		}
+		if _, err := LoadDotEnv(p); err != nil {
+			return p, err
+		}
+		abs, _ := filepath.Abs(p)
+		return abs, nil
+	}
+	return "", nil
+}
 
 // LoadDotEnv loads KEY=VALUE lines from path into the process environment for
 // local development. Variables already set in the environment win (so the

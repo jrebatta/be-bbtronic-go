@@ -31,15 +31,21 @@ Flujo de una mutación: autenticar → `BEGIN` → `SELECT … FOR UPDATE` sala 
 `AdvanceDue` (deadlines/presencia) → `expectedVersion` → regla de juego → persistir + `state_version++` +
 recibo → `COMMIT` → aviso al hub local. Otras instancias lo descubren por sondeo batch de revisiones.
 
-## Ejecución local (rápida)
+## Ejecución local (un solo comando)
 
 1. Edita `backend-go/.env` (no se sube a git) y pega tu cadena de Neon en `DATABASE_URL`.
-2. Desde PowerShell, en la raíz del repo:
+2. Solo la primera vez: `powershell -ExecutionPolicy Bypass -File backend-go\scripts\dev.ps1 setup` (migración).
+3. Arranca con **`start-backend`** desde la raíz del repo (o doble clic en `start-backend.cmd`):
+   compila `backend-go\bin\bbtronic-server.exe`, verifica la BD y sirve en **http://localhost:8081**.
+   `start-backend --skip-check` omite la verificación. El `.exe` también puede lanzarse directamente:
+   busca `.env` en el directorio actual, junto al ejecutable o en su carpeta padre.
+
+Otros atajos, desde PowerShell en la raíz del repo:
 
 ```powershell
 .\backend-go\scripts\dev.ps1 check   # diagnóstico sin modificar nada
 .\backend-go\scripts\dev.ps1 setup   # migración aditiva + semillas (pide confirmación)
-.\backend-go\scripts\dev.ps1 run     # servidor en http://localhost:8080
+.\backend-go\scripts\dev.ps1 run     # servidor en http://localhost:8081
 .\backend-go\scripts\dev.ps1 smoke   # (otra terminal) prueba completa
 ```
 
@@ -57,8 +63,8 @@ go run ./cmd/admin seed-catalogs -confirm
 # (opcional) cargar preguntas de prueba en yo_nunca_nunca, cultura_pendeja, quien_es_mas_probable, preguntas_incomodas
 
 $env:APP_ENV = "development"; $env:ALLOWED_ORIGINS = "http://localhost:5173"
-go run ./cmd/server          # http://localhost:8080/healthz
-go run ./cmd/smoke -base http://localhost:8080 -origin http://localhost:5173 -full
+go run ./cmd/server          # http://localhost:8081/healthz
+go run ./cmd/smoke -base http://localhost:8081 -origin http://localhost:5173 -full
 ```
 
 ## Pruebas

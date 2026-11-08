@@ -31,7 +31,7 @@ type smoke struct {
 }
 
 func main() {
-	base := flag.String("base", "http://localhost:8080", "deployment base URL")
+	base := flag.String("base", "http://localhost:8081", "deployment base URL")
 	origin := flag.String("origin", "https://fe-bbtronic-vue.vercel.app", "an allowed Origin")
 	full := flag.Bool("full", false, "run the database-backed flow (register, room, WS snapshot, command)")
 	flag.Parse()

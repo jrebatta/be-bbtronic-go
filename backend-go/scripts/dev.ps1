@@ -6,7 +6,7 @@
   Uso (desde cualquier carpeta):
     .\backend-go\scripts\dev.ps1 check     # revisa la BD sin modificar nada
     .\backend-go\scripts\dev.ps1 setup     # aplica la migracion y las semillas (pide confirmacion)
-    .\backend-go\scripts\dev.ps1 run       # arranca el servidor en http://localhost:8080
+    .\backend-go\scripts\dev.ps1 run       # arranca el servidor en http://localhost:8081
     .\backend-go\scripts\dev.ps1 smoke     # prueba completa contra el servidor local (en otra terminal)
     .\backend-go\scripts\dev.ps1 test      # tests unitarios
 
@@ -57,11 +57,11 @@ switch ($Command) {
     }
     'run' {
         Assert-DatabaseUrl
-        Write-Host 'Servidor en http://localhost:8080  (Ctrl+C para detener)' -ForegroundColor Green
+        Write-Host 'Servidor en http://localhost:8081  (Ctrl+C para detener)' -ForegroundColor Green
         go run ./cmd/server
     }
     'smoke' {
-        go run ./cmd/smoke -base http://localhost:8080 -origin http://localhost:5173 -full
+        go run ./cmd/smoke -base http://localhost:8081 -origin http://localhost:5173 -full
     }
     'test' {
         go test ./...

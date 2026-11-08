@@ -39,7 +39,7 @@ func run(args []string) error {
 	if len(args) == 0 {
 		return errors.New("usage: admin <check-db|inspect-schema|migrate|seed-catalogs|list-players|purge-receipts> [flags]")
 	}
-	if _, err := config.LoadDotEnv(".env"); err != nil {
+	if _, err := config.LoadLocalDotEnv(); err != nil {
 		return err
 	}
 	cmd, rest := args[0], args[1:]

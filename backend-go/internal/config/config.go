@@ -82,7 +82,7 @@ func Load(getenv func(string) string) (Config, error) {
 
 	c := Config{
 		AppEnv:           str("APP_ENV", ""),
-		Port:             str("PORT", "8080"),
+		Port:             str("PORT", "8081"),
 		DatabaseURL:      getenv("DATABASE_URL"),
 		PGMaxConns:       int32(integer("PG_MAX_CONNS", 2, 1, 50)),
 		PGMinConns:       int32(integer("PG_MIN_CONNS", 0, 0, 10)),
