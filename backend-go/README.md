@@ -4,6 +4,7 @@ Migración del backend Spring Boot de BBtronic a Go: `net/http`, `pgx/v5` sobre 
 (Neon), WebSockets JSON nativos con `github.com/coder/websocket`, preparado para Vercel Hobby. Sin Redis,
 Docker, brokers, ORM ni framework HTTP.
 
+- Guía paso a paso con curl (2 jugadores, todos los juegos): [docs/GUIA_PRUEBAS_CURL.md](docs/GUIA_PRUEBAS_CURL.md)
 - Contrato REST v1: [docs/API.md](docs/API.md) · OpenAPI 3.1: [docs/swagger.yml](docs/swagger.yml)
 - Protocolo WebSocket v1: [docs/WEBSOCKET.md](docs/WEBSOCKET.md)
 - Equivalencia con los 37 endpoints Java: [docs/TRACEABILITY.md](docs/TRACEABILITY.md)
