@@ -37,10 +37,10 @@ recibo → `COMMIT` → aviso al hub local. Otras instancias lo descubren por so
 2. Desde PowerShell, en la raíz del repo:
 
 ```powershell
-.backend-go\scripts\dev.ps1 check   # diagnóstico sin modificar nada
-.backend-go\scripts\dev.ps1 setup   # migración aditiva + semillas (pide confirmación)
-.backend-go\scripts\dev.ps1 run     # servidor en http://localhost:8080
-.backend-go\scripts\dev.ps1 smoke   # (otra terminal) prueba completa
+.\backend-go\scripts\dev.ps1 check   # diagnóstico sin modificar nada
+.\backend-go\scripts\dev.ps1 setup   # migración aditiva + semillas (pide confirmación)
+.\backend-go\scripts\dev.ps1 run     # servidor en http://localhost:8080
+.\backend-go\scripts\dev.ps1 smoke   # (otra terminal) prueba completa
 ```
 
 ## Ejecución local (manual, BD propia)
