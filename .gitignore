@@ -1,0 +1,17 @@
+# Local agent tooling (not part of the migration deliverable)
+/.claude/
+/.agents/
+/agent/
+/skills-lock.json
+
+# Secrets and Vercel local state
+.env
+.env.*
+!.env.example
+.vercel/
+
+# Build artifacts
+*.exe
+*.test
+*.out
+/backend-go/bin/
