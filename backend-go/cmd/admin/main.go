@@ -2,6 +2,7 @@
 // inventory endpoints and the start-up side effects with explicit, audited
 // commands. It never runs automatically.
 //
+//	admin check-db                            read-only readiness report (tables, migration, catalogs)
 //	admin inspect-schema [-show-routine]      read-only catalog inspection (plan 8.1)
 //	admin migrate -confirm                    apply additive migrations
 //	admin seed-catalogs -confirm              Java seeds into empty tables only
@@ -17,6 +18,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net/url"
 	"os"
 	"os/signal"
 	"text/tabwriter"
@@ -35,7 +37,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: admin <inspect-schema|migrate|seed-catalogs|list-players|purge-receipts> [flags]")
+		return errors.New("usage: admin <check-db|inspect-schema|migrate|seed-catalogs|list-players|purge-receipts> [flags]")
 	}
 	if _, err := config.LoadDotEnv(".env"); err != nil {
 		return err
@@ -76,6 +78,8 @@ func run(args []string) error {
 	defer st.Close()
 
 	switch cmd {
+	case "check-db":
+		return checkDB(ctx, st, dsn)
 	case "inspect-schema":
 		return st.InspectSchema(ctx, os.Stdout, *showRoutine)
 	case "migrate":
@@ -111,4 +115,50 @@ func run(args []string) error {
 		return err
 	}
 	return fmt.Errorf("unknown command %q", cmd)
+}
+
+// checkDB prints a read-only readiness report. Only the host is shown, never
+// the user or password of the DSN.
+func checkDB(ctx context.Context, st *store.Store, dsn string) error {
+	host := "?"
+	if u, err := url.Parse(dsn); err == nil {
+		host = u.Hostname()
+	}
+	fmt.Printf("host: %s\n", host)
+	r, err := st.Check(ctx)
+	if err != nil {
+		return fmt.Errorf("no se pudo consultar la base de datos (revisa DATABASE_URL): %w", err)
+	}
+	fmt.Printf("postgres: %s\n", r.ServerVersion)
+	ok := true
+	if len(r.MissingTables) > 0 {
+		ok = false
+		fmt.Printf("FALTAN tablas de Spring Boot: %v\n", r.MissingTables)
+		fmt.Println("  -> en una BD vacía de desarrollo: psql -d <bd> -f internal/testdb/baseline_hibernate_inferred.sql")
+	}
+	for _, t := range []string{"users", "game_session", "question", "yo_nunca_nunca", "cultura_pendeja",
+		"quien_es_mas_probable", "preguntas_incomodas", "impostor_word", "waiting_messages"} {
+		if n, found := r.Counts[t]; found {
+			fmt.Printf("  %-22s %d filas\n", t, n)
+		}
+	}
+	if r.MigrationApplied {
+		fmt.Println("migración 0001_go_runtime: aplicada")
+	} else {
+		ok = false
+		fmt.Println("migración 0001_go_runtime: PENDIENTE -> go run ./cmd/admin migrate -confirm")
+	}
+	if r.Counts["impostor_word"] == 0 || r.Counts["waiting_messages"] == 0 {
+		fmt.Println("semillas: faltan palabras/mensajes -> go run ./cmd/admin seed-catalogs -confirm")
+	}
+	for _, t := range []string{"yo_nunca_nunca", "cultura_pendeja", "quien_es_mas_probable", "preguntas_incomodas"} {
+		if n, found := r.Counts[t]; found && n == 0 {
+			fmt.Printf("aviso: %s está vacía; ese juego responderá CATALOG_EMPTY\n", t)
+		}
+	}
+	if ok {
+		fmt.Println("RESULTADO: lista para el backend Go")
+		return nil
+	}
+	return errors.New("la base de datos aún no está lista (ver arriba)")
 }

@@ -44,6 +44,54 @@ func (s *Store) ListPlayers(ctx context.Context, onlineOnly bool, now time.Time)
 	return out, rows.Err()
 }
 
+// CheckReport summarizes whether a database is ready for the Go backend.
+type CheckReport struct {
+	ServerVersion    string
+	MissingTables    []string
+	MigrationApplied bool
+	Counts           map[string]int64
+}
+
+// requiredTables are the Spring Boot tables the Go backend reuses.
+var requiredTables = []string{"game_session", "users", "question", "shown_questions",
+	"yo_nunca_nunca", "cultura_pendeja", "quien_es_mas_probable", "preguntas_incomodas",
+	"impostor_word", "waiting_messages"}
+
+// Check is a read-only readiness diagnosis: connectivity, Java tables,
+// migration status and catalog sizes.
+func (s *Store) Check(ctx context.Context) (CheckReport, error) {
+	r := CheckReport{Counts: map[string]int64{}}
+	if err := s.pool.QueryRow(ctx, `SHOW server_version`).Scan(&r.ServerVersion); err != nil {
+		return r, fmt.Errorf("connecting: %w", err)
+	}
+	for _, t := range requiredTables {
+		var exists bool
+		if err := s.pool.QueryRow(ctx, `SELECT to_regclass($1) IS NOT NULL`, t).Scan(&exists); err != nil {
+			return r, fmt.Errorf("checking %s: %w", t, err)
+		}
+		if !exists {
+			r.MissingTables = append(r.MissingTables, t)
+			continue
+		}
+		var n int64
+		if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM `+t).Scan(&n); err != nil { // t from constant list
+			return r, fmt.Errorf("counting %s: %w", t, err)
+		}
+		r.Counts[t] = n
+	}
+	var hasTable bool
+	if err := s.pool.QueryRow(ctx, `SELECT to_regclass('go_schema_migrations') IS NOT NULL`).Scan(&hasTable); err != nil {
+		return r, fmt.Errorf("checking migrations: %w", err)
+	}
+	if hasTable {
+		if err := s.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM go_schema_migrations WHERE version = '0001_go_runtime')`).
+			Scan(&r.MigrationApplied); err != nil {
+			return r, fmt.Errorf("checking migrations: %w", err)
+		}
+	}
+	return r, nil
+}
+
 // InspectSchema prints the read-only catalog queries of plan 8.1. The body of
 // reset_game_data is printed only when showRoutine is set (it may contain
 // sensitive logic and must be reviewed before being versioned).

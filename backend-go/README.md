@@ -31,7 +31,19 @@ Flujo de una mutación: autenticar → `BEGIN` → `SELECT … FOR UPDATE` sala 
 `AdvanceDue` (deadlines/presencia) → `expectedVersion` → regla de juego → persistir + `state_version++` +
 recibo → `COMMIT` → aviso al hub local. Otras instancias lo descubren por sondeo batch de revisiones.
 
-## Ejecución local
+## Ejecución local (rápida)
+
+1. Edita `backend-go/.env` (no se sube a git) y pega tu cadena de Neon en `DATABASE_URL`.
+2. Desde PowerShell, en la raíz del repo:
+
+```powershell
+.ackend-go\scripts\dev.ps1 check   # diagnóstico sin modificar nada
+.ackend-go\scripts\dev.ps1 setup   # migración aditiva + semillas (pide confirmación)
+.ackend-go\scripts\dev.ps1 run     # servidor en http://localhost:8080
+.ackend-go\scripts\dev.ps1 smoke   # (otra terminal) prueba completa
+```
+
+## Ejecución local (manual, BD propia)
 
 Requisitos: Go ≥ 1.25, PostgreSQL ≥ 13 local (sin Docker).
 
