@@ -15,6 +15,33 @@ admite WebSockets con `github.com/coder/websocket`. No usa base de datos ni dato
 `go run ./cmd/wsprobe -base http://localhost:3999 -allowed-origin http://localhost:5173` → 12/12 PASS
 (101, eco Unicode, ping, cierre 1000, 2 clientes, broadcast, 3 reconexiones, Origin 403, frame 20 KiB → 1009).
 
+## Resultado en Vercel Preview (2026-11-08) — EVIDENCIA DESPLEGADA
+
+Proyecto de pruebas `bbtronic-ws-spike` (cuenta Hobby del usuario), Deployment Protection activa + bypass
+de automatización. Preview `bbtronic-ws-spike-9769ttcww-…vercel.app` (`vercelEnv=preview`, región `iad1`,
+`goVersion=go1.25.0`, runtime de logs `executable`). Control sin bypass: `302` (protección efectiva).
+
+| Prueba | Resultado |
+|---|---|
+| `GET /healthz` | 200, ~400–600 ms en frío desde `gru1` |
+| Handshake WS | **101** `Upgrade: websocket` |
+| Eco Unicode, 10 mensajes en orden, ping/pong | PASS, RTT ~195 ms (cliente en Perú → `iad1`) |
+| Cierre normal 1000 | PASS (logs del servidor: `status=1000`) |
+| 2 clientes simultáneos | PASS, misma instancia (`6b7d7fb10897`), broadcast local entregado |
+| 4 reconexiones | PASS |
+| Origin ajeno | 403 |
+| Frame 20 KiB | cierre 1009 |
+| Sesión de 16 min (`-hold 16m`) | **3 cortes de la plataforma a 5 min 10 s** (cliente) / **300 000 ms** (servidor: EOF, sin frame de cierre, sin señal); reconexión correcta tras cada corte; el proceso siguió vivo (misma instancia) y ejecutó su limpieza |
+
+Conclusión: **Go + coder/websocket funciona en Vercel Hobby (Preview)** con un máximo efectivo de 300 s por
+conexión. Diseño resultante: rotación del servidor a 270 s (`server.reconnect` + 1012) y recuperación por
+snapshot. No demostrado: reparto real entre varias instancias (todas las conexiones cayeron en una) ni el
+comportamiento durante un redeploy con sockets abiertos.
+
+El backend completo (`backend-go`) se desplegó también como Preview del mismo proyecto y pasó `cmd/smoke`
+(12/12: health, cabeceras, CORS, Origin, errores, upgrade 101 a través del middleware real, cierres 1008, y
+degradación `DATABASE_UNAVAILABLE`/1013 al no tener BD alcanzable).
+
 ## Despliegue Preview (requiere tu sesión; no compartas credenciales)
 
 ```powershell
